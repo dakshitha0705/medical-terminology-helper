@@ -152,3 +152,31 @@ def test_milestone_2_embeddings_add_token_and_position_vectors():
     assert x.shape == (3, 10, 8)
     expected = emb.token_embedding(idx) + emb.position_embedding(torch.arange(10))
     assert torch.allclose(x, expected)
+
+
+# Milestone 3: Build the causal self-attention mechanism and assemble the transformer block.
+import math  # noqa: E402
+
+SMALL = core.GPTConfig(vocab_size=50, block_size=16, n_embd=32, n_heads=4, n_layers=2, dropout=0.0)
+
+
+def test_milestone_3_causal_mask_blocks_the_future():
+    torch.manual_seed(0)
+    model = core.GPT(SMALL).eval()
+    x = torch.randint(0, 50, (1, 12))
+    logits, _ = model(x)
+    w = model.blocks[0].sa.heads[0].last_attention[0]
+    assert torch.all(w.triu(1) == 0) and torch.allclose(w.sum(-1), torch.ones(12))
+    x2 = x.clone(); x2[0, 8:] = (x2[0, 8:] + 1) % 50                # change only the future
+    logits2, _ = model(x2)
+    assert torch.allclose(logits[0, :8], logits2[0, :8], atol=1e-6)
+
+
+def test_milestone_3_shapes_and_untrained_loss_near_log_vocab():
+    torch.manual_seed(0)
+    model = core.milestone_3(SMALL)
+    x, y = torch.randint(0, 50, (4, 16)), torch.randint(0, 50, (4, 16))
+    logits, loss = model(x, y)
+    assert logits.shape == (4, 16, 50)
+    assert model.blocks[0](torch.randn(4, 16, 32)).shape == (4, 16, 32)
+    assert abs(loss.item() - math.log(50)) < 0.1

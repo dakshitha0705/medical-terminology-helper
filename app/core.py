@@ -12,6 +12,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT / "data"          # never committed (.gitignore)
@@ -360,8 +361,111 @@ def milestone_2(train_text: str, vocab_size: int = 1000, verbose: bool = False) 
 
 # --- Milestone 3: Build the causal self-attention mechanism and assemble the transformer block.
 # Hint: Implement the masked self-attention mechanism and feed-forward network.
-def milestone_3():  # TODO(milestone 3)
-    raise NotImplementedError("TODO(milestone 3)")
+#
+# The drill's Head / MultiHeadAttention / FeedForward / Block / GPT (mini_gpt.py, notebooks 04-07),
+# almost as-is. Changes: sizes come from a GPTConfig instead of globals, dropout, GPT-2 style
+# N(0, 0.02) init (so the untrained loss sits at log(vocab)), and `last_attention` kept for tests.
+
+
+@dataclass
+class GPTConfig:
+    vocab_size: int = 1000
+    block_size: int = 128     # context length (tokens)
+    n_embd: int = 128         # embedding size
+    n_heads: int = 4          # attention heads
+    n_layers: int = 4         # transformer blocks
+    dropout: float = 0.1
+
+
+class Head(nn.Module):
+    """One head of masked scaled dot-product self-attention (drill lesson 4 + 5)."""
+
+    def __init__(self, cfg: GPTConfig, head_size: int):
+        super().__init__()
+        self.key = nn.Linear(cfg.n_embd, head_size, bias=False)
+        self.query = nn.Linear(cfg.n_embd, head_size, bias=False)
+        self.value = nn.Linear(cfg.n_embd, head_size, bias=False)
+        self.register_buffer("tril", torch.tril(torch.ones(cfg.block_size, cfg.block_size)))
+        self.drop = nn.Dropout(cfg.dropout)
+        self.last_attention = None
+
+    def forward(self, x):
+        B, T, C = x.shape
+        k, q, v = self.key(x), self.query(x), self.value(x)
+        wei = q @ k.transpose(-2, -1) * k.shape[-1] ** -0.5            # (B, T, T) scaled scores
+        wei = wei.masked_fill(self.tril[:T, :T] == 0, float("-inf"))   # causal mask: no peeking ahead
+        wei = F.softmax(wei, dim=-1)
+        self.last_attention = wei.detach()
+        return self.drop(wei) @ v
+
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, cfg: GPTConfig):
+        super().__init__()
+        head_size = cfg.n_embd // cfg.n_heads
+        self.heads = nn.ModuleList([Head(cfg, head_size) for _ in range(cfg.n_heads)])
+        self.proj = nn.Linear(cfg.n_heads * head_size, cfg.n_embd)
+        self.drop = nn.Dropout(cfg.dropout)
+
+    def forward(self, x):
+        return self.drop(self.proj(torch.cat([h(x) for h in self.heads], dim=-1)))
+
+
+class FeedForward(nn.Module):
+    def __init__(self, cfg: GPTConfig):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(cfg.n_embd, 4 * cfg.n_embd), nn.ReLU(),
+                                 nn.Linear(4 * cfg.n_embd, cfg.n_embd), nn.Dropout(cfg.dropout))
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class Block(nn.Module):
+    """Communicate (attention) then think (feed-forward); pre-norm with residual connections."""
+
+    def __init__(self, cfg: GPTConfig):
+        super().__init__()
+        self.sa, self.ff = MultiHeadAttention(cfg), FeedForward(cfg)
+        self.ln1, self.ln2 = nn.LayerNorm(cfg.n_embd), nn.LayerNorm(cfg.n_embd)
+
+    def forward(self, x):
+        x = x + self.sa(self.ln1(x))
+        return x + self.ff(self.ln2(x))
+
+
+class GPT(nn.Module):
+    def __init__(self, cfg: GPTConfig):
+        super().__init__()
+        self.cfg = cfg
+        self.embed = Embeddings(cfg.vocab_size, cfg.block_size, cfg.n_embd, cfg.dropout)
+        self.blocks = nn.Sequential(*[Block(cfg) for _ in range(cfg.n_layers)])
+        self.ln_f = nn.LayerNorm(cfg.n_embd)
+        self.lm_head = nn.Linear(cfg.n_embd, cfg.vocab_size)
+        self.apply(self._init)
+
+    @staticmethod
+    def _init(m):
+        if isinstance(m, (nn.Linear, nn.Embedding)):
+            nn.init.normal_(m.weight, std=0.02)
+            if getattr(m, "bias", None) is not None:
+                nn.init.zeros_(m.bias)
+
+    def forward(self, idx, targets=None):
+        B, T = idx.shape
+        x = self.ln_f(self.blocks(self.embed(idx)))
+        logits = self.lm_head(x)                                       # (B, T, vocab)
+        if targets is None:
+            return logits, None
+        return logits, F.cross_entropy(logits.view(B * T, -1), targets.view(B * T))
+
+    def num_params(self) -> int:
+        return sum(p.numel() for p in self.parameters())
+
+
+def milestone_3(cfg: GPTConfig | None = None) -> GPT:
+    """Build the GPT for a given config."""
+    return GPT(cfg or GPTConfig())
 
 
 # --- Milestone 4: Set up the training loop and train the GPT model on the medical text data.
