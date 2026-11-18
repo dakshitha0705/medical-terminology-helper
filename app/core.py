@@ -3,10 +3,15 @@
 Medical Terminology Helper: a GPT built from scratch (as in my "Build GPT from Scratch" drill),
 trained on public-domain anatomy/physiology books. Everything here runs on a laptop CPU.
 """
+import json
 import re
 import unicodedata
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
+
+import torch
+import torch.nn as nn
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT / "data"          # never committed (.gitignore)
@@ -199,8 +204,158 @@ def milestone_1(raw_books: dict[int, str]) -> tuple[str, str, str]:
 
 # --- Milestone 2: Implement the byte-pair tokenizer and generate embeddings from the medical corpus.
 # Hint: Apply the byte-pair encoding (BPE) and embedding layer concepts.
-def milestone_2():  # TODO(milestone 2)
-    raise NotImplementedError("TODO(milestone 2)")
+#
+# The drill used one token per character (65 tokens). Here BPE starts from the corpus characters and
+# repeatedly merges the most frequent adjacent pair into a new token, so frequent pieces such as
+# " the", "ation", " card" or " muscle" become single tokens. Text is first split into chunks
+# (a word with its leading space, a number, punctuation, whitespace) and merges never cross chunks.
+
+CHUNK_RE = re.compile(r" ?[A-Za-z]+| ?[0-9]+| ?[^\sA-Za-z0-9]+|\s+")
+
+
+class UnknownCharacterError(ValueError):
+    """Raised when text contains characters the tokenizer never saw (after normalisation)."""
+    def __init__(self, chars: list[str]):
+        self.chars = chars
+        super().__init__(f"unknown characters: {' '.join(repr(c) for c in chars)}")
+
+
+class BPETokenizer:
+    """Byte-pair encoding written from scratch: train / encode / decode / save / load."""
+
+    def __init__(self, chars: list[str] | None = None, merges: list[tuple[int, int]] | None = None):
+        self.chars = list(chars or [])
+        self.merges = [tuple(m) for m in (merges or [])]
+        self._build()
+
+    def _build(self) -> None:
+        self.vocab = list(self.chars)                       # id -> token string
+        self.ranks = {}                                     # (a, b) -> merge rank
+        for rank, (a, b) in enumerate(self.merges):
+            self.ranks[(a, b)] = rank
+            self.vocab.append(self.vocab[a] + self.vocab[b])
+        self.stoi = {c: i for i, c in enumerate(self.chars)}
+        self.merged = {pair: len(self.chars) + r for pair, r in self.ranks.items()}
+        self._cache: dict[str, list[int]] = {}
+
+    @property
+    def vocab_size(self) -> int:
+        return len(self.vocab)
+
+    # -- training -------------------------------------------------------------------------------
+    @classmethod
+    def train(cls, text: str, vocab_size: int, verbose: bool = False) -> "BPETokenizer":
+        chars = sorted(set(text))
+        if vocab_size < len(chars):
+            raise ValueError(f"vocab_size {vocab_size} is smaller than the {len(chars)} base characters")
+        stoi = {c: i for i, c in enumerate(chars)}
+        chunk_counts = Counter(CHUNK_RE.findall(text))
+        words = [[stoi[c] for c in w] for w in chunk_counts]          # each distinct chunk once ...
+        freqs = list(chunk_counts.values())                          # ... weighted by its count
+        pair_counts: Counter = Counter()
+        where: dict[tuple[int, int], set[int]] = defaultdict(set)    # pair -> chunks containing it
+        for wi, w in enumerate(words):
+            for pair in zip(w, w[1:]):
+                pair_counts[pair] += freqs[wi]
+                where[pair].add(wi)
+
+        merges = []
+        for new_id in range(len(chars), vocab_size):
+            if not pair_counts:
+                break
+            best = max(pair_counts, key=lambda p: (pair_counts[p], -p[0], -p[1]))
+            if pair_counts[best] < 2:
+                break
+            merges.append(best)
+            for wi in list(where[best]):                             # only chunks that contain it
+                w, f = words[wi], freqs[wi]
+                for pair in zip(w, w[1:]):                           # remove old pair counts
+                    pair_counts[pair] -= f
+                    if pair_counts[pair] <= 0:
+                        del pair_counts[pair]
+                    where[pair].discard(wi)
+                words[wi] = w = cls._merge(w, best, new_id)
+                for pair in zip(w, w[1:]):                           # add the new ones
+                    pair_counts[pair] += f
+                    where[pair].add(wi)
+            if verbose and len(merges) % 250 == 0:
+                tok = cls(chars, merges)
+                print(f"  merge {len(merges):5d}: {tok.vocab[new_id]!r}")
+        return cls(chars, merges)
+
+    @staticmethod
+    def _merge(ids: list[int], pair: tuple[int, int], new_id: int) -> list[int]:
+        out, i = [], 0
+        while i < len(ids):
+            if i + 1 < len(ids) and ids[i] == pair[0] and ids[i + 1] == pair[1]:
+                out.append(new_id)
+                i += 2
+            else:
+                out.append(ids[i])
+                i += 1
+        return out
+
+    # -- encode / decode ------------------------------------------------------------------------
+    def unknown_chars(self, text: str) -> list[str]:
+        return sorted(set(text) - set(self.stoi))
+
+    def _encode_chunk(self, chunk: str) -> list[int]:
+        if chunk in self._cache:
+            return self._cache[chunk]
+        ids = [self.stoi[c] for c in chunk]
+        while len(ids) >= 2:                                         # apply merges in training order
+            pair = min(zip(ids, ids[1:]), key=lambda p: self.ranks.get(p, float("inf")))
+            if pair not in self.ranks:
+                break
+            ids = self._merge(ids, pair, self.merged[pair])
+        if len(self._cache) < 100_000:
+            self._cache[chunk] = ids
+        return ids
+
+    def encode(self, text: str) -> list[int]:
+        bad = self.unknown_chars(text)
+        if bad:
+            raise UnknownCharacterError(bad)
+        return [i for chunk in CHUNK_RE.findall(text) for i in self._encode_chunk(chunk)]
+
+    def decode(self, ids: list[int]) -> str:
+        return "".join(self.vocab[i] for i in ids)
+
+    def tokens(self, text: str) -> list[str]:
+        """How a piece of text is split, e.g. ' cardiomyopathy' -> [' card', 'i', 'om', ...]."""
+        return [self.vocab[i] for i in self.encode(text)]
+
+    # -- save / load ----------------------------------------------------------------------------
+    def save(self, path) -> None:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_text(json.dumps({"type": "bpe", "chars": self.chars,
+                                          "merges": [list(m) for m in self.merges]}))
+
+    @classmethod
+    def load(cls, path) -> "BPETokenizer":
+        d = json.loads(Path(path).read_text())
+        return cls(d["chars"], [tuple(m) for m in d["merges"]])
+
+
+class Embeddings(nn.Module):
+    """Token embedding + learned positional embedding, exactly as in the drill's GPT:
+    x = token_embedding(idx) + position_embedding(arange(T))."""
+
+    def __init__(self, vocab_size: int, block_size: int, n_embd: int, dropout: float = 0.0):
+        super().__init__()
+        self.token_embedding = nn.Embedding(vocab_size, n_embd)
+        self.position_embedding = nn.Embedding(block_size, n_embd)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, idx: torch.Tensor) -> torch.Tensor:
+        T = idx.shape[1]
+        pos = torch.arange(T, device=idx.device)
+        return self.drop(self.token_embedding(idx) + self.position_embedding(pos))   # (B, T, n_embd)
+
+
+def milestone_2(train_text: str, vocab_size: int = 1000, verbose: bool = False) -> BPETokenizer:
+    """Train the BPE tokenizer on the training split (`scripts/tokenize_corpus.py` reports on it)."""
+    return BPETokenizer.train(train_text, vocab_size, verbose=verbose)
 
 
 # --- Milestone 3: Build the causal self-attention mechanism and assemble the transformer block.

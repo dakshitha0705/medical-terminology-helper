@@ -97,3 +97,58 @@ def test_milestone_1_runs_end_to_end_without_downloads(monkeypatch):
     monkeypatch.setattr(core, "SOURCES", [FAKE_SOURCE])
     corpus, train, val = core.milestone_1({99999: FAKE_BOOK})
     assert corpus.startswith("The femur") and train and corpus.endswith("\n")
+
+
+# Milestone 2: Implement the byte-pair tokenizer and generate embeddings from the medical corpus.
+import torch  # noqa: E402
+
+TINY = ("The heart pumps blood. The heart has four chambers. The pericardium surrounds the heart.\n"
+        "Cardiac muscle contracts; the cardiac cycle repeats about 72 times a minute.\n") * 5
+
+
+def test_milestone_2_bpe_round_trips_and_compresses():
+    tok = core.BPETokenizer.train(TINY, vocab_size=80)
+    assert tok.vocab_size == 80 and len(tok.merges) == 80 - len(set(TINY))
+    ids = tok.encode(TINY)
+    assert tok.decode(ids) == TINY
+    assert len(ids) < len(TINY) / 2                       # merges really compress
+    assert " heart" in tok.vocab                          # a frequent word became one token
+    assert "".join(tok.tokens(" cardiac")) == " cardiac"
+    unseen = "The blood of the cardiac heart."
+    assert tok.decode(tok.encode(unseen)) == unseen
+
+
+def test_milestone_2_most_frequent_pair_is_merged_first():
+    tok = core.BPETokenizer.train("ab ab ab ab cd", vocab_size=len(set("ab ab ab ab cd")) + 1)
+    assert tok.vocab[-1] == "ab"
+
+
+def test_milestone_2_save_and_load_give_the_same_tokenizer(tmp_path):
+    tok = core.BPETokenizer.train(TINY, vocab_size=70)
+    tok.save(tmp_path / "tok.json")
+    tok2 = core.BPETokenizer.load(tmp_path / "tok.json")
+    assert tok2.vocab == tok.vocab and tok2.encode(TINY) == tok.encode(TINY)
+
+
+def test_milestone_2_unknown_characters_raise_a_clear_error():
+    tok = core.BPETokenizer.train(TINY, vocab_size=60)
+    try:
+        tok.encode("The heart @ #")
+        raise AssertionError("expected UnknownCharacterError")
+    except core.UnknownCharacterError as e:
+        assert e.chars == ["#", "@"]
+
+
+def test_milestone_2_vocab_smaller_than_alphabet_is_rejected():
+    import pytest
+    with pytest.raises(ValueError):
+        core.BPETokenizer.train(TINY, vocab_size=5)
+
+
+def test_milestone_2_embeddings_add_token_and_position_vectors():
+    emb = core.Embeddings(vocab_size=50, block_size=16, n_embd=8)
+    idx = torch.randint(0, 50, (3, 10))
+    x = emb(idx)
+    assert x.shape == (3, 10, 8)
+    expected = emb.token_embedding(idx) + emb.position_embedding(torch.arange(10))
+    assert torch.allclose(x, expected)
