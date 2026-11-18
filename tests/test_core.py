@@ -103,7 +103,8 @@ def test_milestone_1_runs_end_to_end_without_downloads(monkeypatch):
 import torch  # noqa: E402
 
 TINY = ("The heart pumps blood. The heart has four chambers. The pericardium surrounds the heart.\n"
-        "Cardiac muscle contracts; the cardiac cycle repeats about 72 times a minute.\n") * 5
+        "Cardiac muscle contracts; the cardiac cycle repeats about 72 times a minute.\n"
+        'Heart: The "pump" of the blood.\n') * 5
 
 
 def test_milestone_2_bpe_round_trips_and_compresses():
@@ -180,3 +181,40 @@ def test_milestone_3_shapes_and_untrained_loss_near_log_vocab():
     assert logits.shape == (4, 16, 50)
     assert model.blocks[0](torch.randn(4, 16, 32)).shape == (4, 16, 32)
     assert abs(loss.item() - math.log(50)) < 0.1
+
+
+# Milestone 4: Set up the training loop and train the GPT model on the medical text data.
+def _tiny_trained(steps=60):
+    torch.manual_seed(0)
+    tok = core.BPETokenizer.train(TINY, vocab_size=60)
+    cfg = core.GPTConfig(vocab_size=60, block_size=16, n_embd=32, n_heads=2, n_layers=1, dropout=0.0)
+    model, hist = core.milestone_4(TINY, TINY, tok, cfg, max_iters=steps, batch_size=8, lr=3e-3,
+                                   eval_batches=2, log=lambda *_: None)
+    return model, tok, hist
+
+
+def test_milestone_4_training_lowers_the_loss():
+    model, tok, hist = _tiny_trained()
+    assert hist[0]["step"] == 0 and hist[-1]["step"] == 60 and len(hist) == 11
+    assert hist[-1]["train"] < hist[0]["train"] - 1.0
+
+
+def test_milestone_4_bigram_baseline_learns_a_deterministic_sequence():
+    ids = [0, 1, 2, 3] * 200
+    assert core.bigram_baseline(ids, ids, 4) < 0.05 < math.log(4)
+
+
+def test_milestone_4_checkpoint_save_and_load(tmp_path):
+    model, tok, _ = _tiny_trained(steps=5)
+    core.save_checkpoint(tmp_path / "m.pt", model, tok, extra={"val": 1.0})
+    model2, tok2, extra = core.load_checkpoint(tmp_path / "m.pt")
+    x = torch.tensor([tok.encode("The heart")])
+    assert torch.allclose(model.eval()(x)[0], model2(x)[0]) and tok2.vocab == tok.vocab
+    assert extra == {"val": 1.0}
+
+
+def test_milestone_4_missing_model_says_how_to_train(tmp_path):
+    import pytest
+    with pytest.raises(core.ModelNotFoundError, match="scripts/train.py"):
+        core.load_checkpoint(tmp_path / "nope.pt")
+

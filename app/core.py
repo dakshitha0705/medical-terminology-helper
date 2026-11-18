@@ -4,10 +4,12 @@ Medical Terminology Helper: a GPT built from scratch (as in my "Build GPT from S
 trained on public-domain anatomy/physiology books. Everything here runs on a laptop CPU.
 """
 import json
+import math
 import re
+import time
 import unicodedata
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import torch
@@ -470,8 +472,96 @@ def milestone_3(cfg: GPTConfig | None = None) -> GPT:
 
 # --- Milestone 4: Set up the training loop and train the GPT model on the medical text data.
 # Hint: Set up your optimizer, loss function, and training loop.
-def milestone_4():  # TODO(milestone 4)
-    raise NotImplementedError("TODO(milestone 4)")
+#
+# Same loop as the drill's lesson 7 (random windows, AdamW, cross-entropy, estimate_loss), plus a
+# cosine learning-rate decay, gradient clipping and a checkpoint that bundles weights + config + tokenizer.
+
+
+def get_batch(data: torch.Tensor, block_size: int, batch_size: int):
+    ix = torch.randint(len(data) - block_size - 1, (batch_size,))
+    x = torch.stack([data[i:i + block_size] for i in ix])
+    y = torch.stack([data[i + 1:i + block_size + 1] for i in ix])
+    return x, y
+
+
+@torch.no_grad()
+def estimate_loss(model: GPT, splits: dict, batch_size: int, n_batches: int = 20) -> dict:
+    model.eval()
+    out = {}
+    for name, data in splits.items():
+        losses = [model(*get_batch(data, model.cfg.block_size, batch_size))[1].item() for _ in range(n_batches)]
+        out[name] = sum(losses) / len(losses)
+    model.train()
+    return out
+
+
+def bigram_baseline(train_ids: list[int], val_ids: list[int], vocab_size: int) -> float:
+    """Validation cross-entropy of a count-based bigram model (add-one smoothing): the bar to beat."""
+    counts = torch.ones(vocab_size, vocab_size)
+    a, b = torch.tensor(train_ids[:-1]), torch.tensor(train_ids[1:])
+    counts.index_put_((a, b), torch.ones(len(a)), accumulate=True)
+    logp = (counts / counts.sum(1, keepdim=True)).log()
+    va, vb = torch.tensor(val_ids[:-1]), torch.tensor(val_ids[1:])
+    return -logp[va, vb].mean().item()
+
+
+def train_model(model: GPT, train_data: torch.Tensor, val_data: torch.Tensor, max_iters: int,
+                batch_size: int = 32, lr: float = 1e-3, eval_every: int | None = None,
+                eval_batches: int = 20, log=print) -> list[dict]:
+    """AdamW + cross-entropy; returns the loss history [{step, train, val, secs}, ...]."""
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.1)
+    sched = torch.optim.lr_scheduler.LambdaLR(
+        opt, lambda s: 0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * min(s, max_iters) / max(max_iters, 1))))
+    eval_every = eval_every or max(max_iters // 10, 1)
+    splits = {"train": train_data, "val": val_data}
+    history, t0 = [], time.time()
+    model.train()
+    for step in range(max_iters + 1):
+        if step % eval_every == 0 or step == max_iters:
+            losses = estimate_loss(model, splits, batch_size, eval_batches)
+            history.append({"step": step, **losses, "secs": round(time.time() - t0, 1)})
+            log(f"step {step:5d}  train {losses['train']:.3f}  val {losses['val']:.3f}  ({time.time() - t0:.0f}s)")
+        if step == max_iters:
+            break
+        _, loss = model(*get_batch(train_data, model.cfg.block_size, batch_size))
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        opt.step()
+        sched.step()
+    return history
+
+
+class ModelNotFoundError(FileNotFoundError):
+    pass
+
+
+def save_checkpoint(path, model: GPT, tok: BPETokenizer, extra: dict | None = None) -> None:
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    torch.save({"config": asdict(model.cfg), "state_dict": model.state_dict(),
+                "tokenizer": {"chars": tok.chars, "merges": [list(m) for m in tok.merges]},
+                "extra": extra or {}}, path)
+
+
+def load_checkpoint(path) -> tuple[GPT, BPETokenizer, dict]:
+    if not Path(path).exists():
+        raise ModelNotFoundError(
+            f"No trained model at {path}.\nTrain one first (about 10 minutes on a laptop CPU):\n"
+            "    python scripts/prepare_data.py\n    python scripts/train.py")
+    ck = torch.load(path, map_location="cpu", weights_only=True)
+    model = GPT(GPTConfig(**ck["config"]))
+    model.load_state_dict(ck["state_dict"])
+    model.eval()
+    return model, BPETokenizer(ck["tokenizer"]["chars"], ck["tokenizer"]["merges"]), ck.get("extra", {})
+
+
+def milestone_4(train_text: str, val_text: str, tok: BPETokenizer, cfg: GPTConfig, max_iters: int,
+                batch_size: int = 32, **kw) -> tuple[GPT, list[dict]]:
+    """Tokenize the splits, build the GPT and train it (`scripts/train.py` handles timing, files, plots)."""
+    train_data = torch.tensor(tok.encode(train_text), dtype=torch.long)
+    val_data = torch.tensor(tok.encode(val_text), dtype=torch.long)
+    model = GPT(cfg)
+    return model, train_model(model, train_data, val_data, max_iters, batch_size, **kw)
 
 
 # --- Milestone 5: Implement a text generation function to complete medical phrases or definitions.
