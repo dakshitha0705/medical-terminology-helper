@@ -1,3 +1,4 @@
+[![Built with askThili](https://ask.thili.ai/api/v1/public/projects/xka8hhccyz/badge.svg)](https://ask.thili.ai/b/xka8hhccyz)
 # Medical Terminology Helper
 
 [![Built with askThili](https://ask.thili.ai/api/v1/public/projects/xka8hhccyz/badge.svg)](https://ask.thili.ai/b/xka8hhccyz)
