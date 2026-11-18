@@ -249,3 +249,59 @@ def test_milestone_5_define_uses_glossary_style_and_rejects_bad_input():
         with pytest.raises(ValueError):
             core.complete(model, tok, **bad)
 
+
+# Milestone 6: Create a CLI for students to enter partial phrases and get completions.
+import pytest  # noqa: E402
+
+from app import cli  # noqa: E402
+
+
+@pytest.fixture
+def tiny_model(tmp_path, monkeypatch):
+    monkeypatch.setenv("DATA_PATH", str(tmp_path / "app.json"))      # history goes to a temp file
+    model, tok, _ = _tiny_trained(steps=5)
+    path = tmp_path / "m.pt"
+    core.save_checkpoint(path, model, tok, extra={"params": model.num_params()})
+    return str(path)
+
+
+def test_milestone_6_parses_commands_and_knobs():
+    a = cli.build_parser().parse_args(["complete", "The femur is", "-n", "20", "-t", "0.5", "-k", "10", "-p", "0.9"])
+    assert (a.command, a.prompt, a.length, a.temperature, a.top_k, a.top_p) == ("complete", "The femur is", 20, 0.5, 10, 0.9)
+    assert cli.build_parser().parse_args(["define", "tachycardia"]).term == "tachycardia"
+    for bad in (["complete", "x", "-t", "0"], ["complete", "x", "-n", "0"], ["complete", "x", "-p", "2"]):
+        with pytest.raises(SystemExit):
+            cli.build_parser().parse_args(bad)
+
+
+def test_milestone_6_one_shot_complete_and_define(tiny_model, capsys):
+    assert cli.main(["complete", "The heart", "-n", "5", "--seed", "0", "--model", tiny_model]) == 0
+    out = capsys.readouterr().out
+    assert "not medical advice" in out.lower() and "The heart" in out
+    assert cli.main(["define", "heart", "--seed", "0", "--model", tiny_model]) == 0
+    assert "Heart:" in capsys.readouterr().out
+    assert cli.main(["history"]) == 0 and "[define] heart" in capsys.readouterr().out
+
+
+def test_milestone_6_friendly_errors(tiny_model, tmp_path, capsys):
+    assert cli.main(["complete", "The femur", "--model", str(tmp_path / "missing.pt")]) == 1
+    assert "python scripts/train.py" in capsys.readouterr().err
+    assert cli.main(["complete", "   ", "--model", tiny_model]) == 1
+    assert "empty" in capsys.readouterr().err
+    assert cli.main(["complete", "The heart @", "--model", tiny_model]) == 1
+    assert "never seen these characters: @" in capsys.readouterr().err
+    assert cli.main(["complete", "The “heart”", "-n", "3", "--model", tiny_model]) == 0   # curly quotes normalised
+
+
+def test_milestone_6_interactive_loop(tiny_model, capsys):
+    lines = iter(["", ":len 3", ":temp 0", "The heart", "define heart", "The # heart", ":bogus", ":quit"])
+    assert cli.main(["interactive", "--seed", "0", "--model", tiny_model], input_fn=lambda _: next(lines)) == 0
+    out = capsys.readouterr().out
+    assert "Type the start of a phrase" in out and "ok: length 3" in out and "Bad value for :temp" in out
+    assert "Heart:" in out and "never seen these characters: #" in out and "Unknown command" in out
+    assert out.rstrip().endswith("Goodbye.")
+
+
+def test_milestone_6_symbols_that_cannot_be_normalised_are_reported(tiny_model, capsys):
+    assert cli.main(["complete", "The heart ♥", "--model", tiny_model]) == 1
+    assert "U+2665" in capsys.readouterr().err

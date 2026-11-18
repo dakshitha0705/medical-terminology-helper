@@ -36,8 +36,9 @@ class MedicalGPT:
         self.model, self.tok, self.info = core.load_checkpoint(self.path)   # ModelNotFoundError if missing
 
     def _prep(self, text: str) -> str:
+        dropped = sorted({c for c in text if not c.isspace() and not core.normalize_chars(c).strip()})
         text = core.normalize_chars(text)            # curly quotes, accents, ½ ... -> the corpus alphabet
-        bad = self.tok.unknown_chars(text)
+        bad = sorted(set(dropped) | set(self.tok.unknown_chars(text)))
         if bad:
             raise core.UnknownCharacterError(bad)
         return text
