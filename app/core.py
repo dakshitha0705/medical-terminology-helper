@@ -566,8 +566,77 @@ def milestone_4(train_text: str, val_text: str, tok: BPETokenizer, cfg: GPTConfi
 
 # --- Milestone 5: Implement a text generation function to complete medical phrases or definitions.
 # Hint: Utilize the model's prediction capabilities to generate sequences.
-def milestone_5():  # TODO(milestone 5)
-    raise NotImplementedError("TODO(milestone 5)")
+#
+# The drill's lesson-8 sampler (temperature, top-k, top-p), now starting from a prompt instead of a
+# blank token, with a length setting and an option to stop at the end of a sentence.
+
+def filter_logits(logits: torch.Tensor, temperature: float = 1.0, top_k: int | None = None,
+                  top_p: float | None = None) -> torch.Tensor:
+    """Apply temperature, then keep only the top-k tokens and/or the smallest set with prob mass >= top_p."""
+    if temperature <= 0:
+        raise ValueError("temperature must be > 0")
+    logits = logits / temperature
+    if top_k is not None and top_k > 0:
+        kth = torch.topk(logits, min(top_k, logits.shape[-1]))[0][..., [-1]]
+        logits = logits.masked_fill(logits < kth, float("-inf"))
+    if top_p is not None and 0 < top_p < 1:
+        s_logits, s_idx = torch.sort(logits, descending=True)
+        cum = F.softmax(s_logits, dim=-1).cumsum(-1)
+        drop = cum > top_p
+        drop[..., 1:] = drop[..., :-1].clone()
+        drop[..., 0] = False                                   # always keep the most likely token
+        s_logits = s_logits.masked_fill(drop, float("-inf"))
+        logits = torch.empty_like(logits).scatter_(-1, s_idx, s_logits)
+    return logits
+
+
+@torch.no_grad()
+def generate(model: GPT, idx: torch.Tensor, max_new_tokens: int, temperature: float = 0.8,
+             top_k: int | None = 40, top_p: float | None = 0.95, stop_ids: set[int] | None = None,
+             min_new_tokens: int = 0) -> torch.Tensor:
+    model.eval()
+    for i in range(max_new_tokens):
+        logits, _ = model(idx[:, -model.cfg.block_size:])
+        probs = F.softmax(filter_logits(logits[:, -1, :], temperature, top_k, top_p), dim=-1)
+        nxt = torch.multinomial(probs, 1)
+        idx = torch.cat([idx, nxt], dim=1)
+        if stop_ids and i + 1 >= min_new_tokens and nxt.item() in stop_ids:
+            break
+    return idx
+
+
+def complete(model: GPT, tok: BPETokenizer, prompt: str, max_new_tokens: int = 60,
+             temperature: float = 0.8, top_k: int | None = 40, top_p: float | None = 0.95,
+             seed: int | None = None, stop_at_sentence: bool = False) -> str:
+    """Return the prompt's continuation (without the prompt)."""
+    if not prompt.strip():
+        raise ValueError("prompt is empty")
+    if max_new_tokens < 1:
+        raise ValueError("length must be at least 1 token")
+    if seed is not None:
+        torch.manual_seed(seed)
+    ids = tok.encode(prompt)
+    stop = {i for i, t in enumerate(tok.vocab) if t.rstrip().endswith((".", "\n"))} if stop_at_sentence else None
+    out = generate(model, torch.tensor([ids]), max_new_tokens, temperature, top_k, top_p, stop, min_new_tokens=4)
+    text = tok.decode(out[0, len(ids):].tolist())
+    return text.split("\n")[0] if stop_at_sentence else text
+
+
+def define_prompt(term: str) -> str:
+    """The glossary in the corpus is formatted 'Pericardium: A membrane that encloses the heart.'"""
+    term = " ".join(term.strip().split())
+    if not term:
+        raise ValueError("term is empty")
+    return term[0].upper() + term[1:].lower() + ":"
+
+
+def define(model: GPT, tok: BPETokenizer, term: str, max_new_tokens: int = 40, **kw) -> str:
+    kw.setdefault("stop_at_sentence", True)
+    return complete(model, tok, define_prompt(term), max_new_tokens, **kw).strip()
+
+
+def milestone_5(model: GPT, tok: BPETokenizer, prompt: str, **kw) -> str:
+    return complete(model, tok, prompt, **kw)
 
 
 # --- Milestone 6: Create a CLI for students to enter partial phrases and get completions.

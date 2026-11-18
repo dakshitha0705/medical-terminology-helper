@@ -218,3 +218,34 @@ def test_milestone_4_missing_model_says_how_to_train(tmp_path):
     with pytest.raises(core.ModelNotFoundError, match="scripts/train.py"):
         core.load_checkpoint(tmp_path / "nope.pt")
 
+
+# Milestone 5: Implement a text generation function to complete medical phrases or definitions.
+def test_milestone_5_top_k_and_top_p_keep_only_likely_tokens():
+    logits = torch.tensor([[4.0, 3.0, 2.0, 1.0, 0.0]])
+    assert torch.isfinite(core.filter_logits(logits, top_k=2)).sum() == 2
+    p = F_softmax = torch.softmax(logits, -1)[0]
+    kept = torch.isfinite(core.filter_logits(logits, top_p=0.7)).sum().item()
+    assert p[:kept].sum() >= 0.7 and p[:kept - 1].sum() < 0.7
+    assert torch.isfinite(core.filter_logits(logits, top_p=0.01)).sum() == 1   # always keeps the best
+    sharp = torch.softmax(core.filter_logits(logits, temperature=0.5), -1)
+    assert sharp[0, 0] > F_softmax[0]                                            # low T sharpens
+
+
+def test_milestone_5_complete_respects_length_and_seed():
+    model, tok, _ = _tiny_trained(steps=5)
+    a = core.complete(model, tok, "The heart", max_new_tokens=7, seed=1)
+    b = core.complete(model, tok, "The heart", max_new_tokens=7, seed=1)
+    assert a == b and len(tok.encode("The heart" + a)) >= len(tok.encode("The heart")) + 1
+    assert len(core.generate(model, torch.tensor([tok.encode("The heart")]), 7)[0]) == \
+        len(tok.encode("The heart")) + 7
+
+
+def test_milestone_5_define_uses_glossary_style_and_rejects_bad_input():
+    import pytest
+    assert core.define_prompt("  tachyCARDIA ") == "Tachycardia:"
+    model, tok, _ = _tiny_trained(steps=5)
+    assert "\n" not in core.define(model, tok, "heart", max_new_tokens=10, seed=0)
+    for bad in [dict(prompt=" "), dict(prompt="The", max_new_tokens=0), dict(prompt="The", temperature=0)]:
+        with pytest.raises(ValueError):
+            core.complete(model, tok, **bad)
+
